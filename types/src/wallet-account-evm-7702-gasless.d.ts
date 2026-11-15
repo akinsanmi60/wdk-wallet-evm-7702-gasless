@@ -1,16 +1,69 @@
 /** @implements {IWalletAccount} */
 export default class WalletAccountEvm7702Gasless extends WalletAccountReadOnlyEvm7702Gasless implements IWalletAccount {
     /**
+     * Creates a new evm 7702 gasless wallet account from a raw private key.
+     *
+     * The account owns the key and wipes it on {@link dispose}.
+     *
+     * @param {string | Uint8Array} privateKey - The raw private key (hex string with or without 0x, or 32 bytes).
+     * @param {Evm7702GaslessWalletConfig} config - The configuration object.
+     * @returns {WalletAccountEvm7702Gasless} The wallet account.
+     */
+    static fromPrivateKey(privateKey: string | Uint8Array, config: Evm7702GaslessWalletConfig): WalletAccountEvm7702Gasless;
+    /**
+     * Determines whether a value is an already-signed UserOperation (as returned by `signTransaction`)
+     * rather than an unsigned {@link EvmTransaction} (or array of them).
+     *
+     * @private
+     * @param {EvmTransaction | EvmTransaction[] | UserOperationV8} tx - The value to inspect.
+     * @returns {boolean} True if the value is a signed UserOperation.
+     */
+    private static _isSignedUserOperation;
+    /**
+     * Computes the fee for an already-signed UserOperation from its own gas fields.
+     *
+     * In token-paymaster mode this reflects the native gas ceiling (in wei) rather than the token
+     * amount: the token cost is set by the paymaster at sign time and cannot be reproduced from the
+     * signed UserOperation.
+     *
+     * @private
+     * @param {UserOperationV8} userOp - The signed UserOperation.
+     * @returns {bigint} The fee, in the account's native coin (wei).
+     */
+    private static _getSignedUserOperationFee;
+    /** @private */
+    private static _getTxKey;
+    /**
      * Creates a new evm 7702 gasless wallet account.
      *
      * @overload
-     * @param {string | Uint8Array} seed - The wallet's BIP-39 seed phrase.
+     * @param {string | Uint8Array} seed - A BIP-39 mnemonic seed phrase, or a raw BIP-32 master seed (16-64 bytes).
      * @param {string} path - The BIP-44 derivation path (e.g. "0'/0/0").
      * @param {Evm7702GaslessWalletConfig} config - The configuration object.
      */
     constructor(seed: string | Uint8Array, path: string, config: Evm7702GaslessWalletConfig);
     /**
+     * Creates a new evm 7702 gasless wallet account from a BIP-39 seed at path m/44'/60'/0'/0/0.
+     *
+     * @overload
+     * @param {string | Uint8Array} seed - A BIP-39 mnemonic seed phrase, or a raw BIP-32 master seed (16-64 bytes).
+     * @param {Evm7702GaslessWalletConfig} config - The configuration object.
+     */
+    constructor(seed: string | Uint8Array, config: Evm7702GaslessWalletConfig);
+    /**
+     * Creates a new evm 7702 gasless wallet account using a signer.
+     *
+     * The signer is wiped on {@link dispose} only if `shouldWipeSignerOnDisposal` is set.
+     *
+     * @overload
+     * @param {ISignerEvm} signer - A signer implementing the EVM signer interface.
+     * @param {Evm7702GaslessWalletConfig & SignerOptions} config - The configuration object.
+     */
+    constructor(signer: ISignerEvm, config: Evm7702GaslessWalletConfig & SignerOptions);
+    /**
      * Creates a new evm 7702 gasless wallet account from a wallet-evm account.
+     *
+     * The wallet-evm account is not disposed on {@link dispose}.
      *
      * @overload
      * @param {WalletAccountEvm} account - The wallet-evm account.
@@ -19,29 +72,58 @@ export default class WalletAccountEvm7702Gasless extends WalletAccountReadOnlyEv
     constructor(account: WalletAccountEvm, config: Evm7702GaslessWalletConfig);
     /** @private */
     private _ownerAccount;
+    /** @private */
+    private _shouldWipeOwnerAccountOnDisposal;
+    /** @private */
+    private _evm7702GaslessReadOnlyAccount;
     /**
-     * The derivation path's index of this account.
+     * Cache of recently-quoted transactions keyed by serialized tx plus the build-relevant
+     * paymaster config (see _getTxKey). sendTransaction, signTransaction, and transfer consume an
+     * entry to skip the gas-estimation + paymaster round-trip when the same tx was just quoted
+     * under the same paymaster mode/token. Entries expire after QUOTE_CACHE_TTL_MS; expired
+     * entries are swept on insert.
      *
-     * @type {number}
+     * @private
+     * @type {Map<string, TransactionQuote>}
      */
-    get index(): number;
+    private _quoteCache;
+    /** @private */
+    private _disposed;
     /**
-     * The derivation path of this account (see [BIP-44](https://github.com/bitcoin/bips/blob/master/bip-0044.mediawiki)).
+     * True if the account has been disposed.
      *
-     * @type {string}
+     * @type {boolean}
      */
-    get path(): string;
+    get disposed(): boolean;
+    /**
+     * The derivation path of this account (see [BIP-44](https://github.com/bitcoin/bips/blob/master/bip-0044.mediawiki)),
+     * or null if the account's signer is not bound to a BIP-44 position (e.g. private-key signers).
+     *
+     * @type {string | null}
+     */
+    get path(): string | null;
     /**
      * The account's key pair.
      *
-     * @type {KeyPair}
+     * The uint8 arrays are bound to the wallet account, so any external change will reflect to the internal representation. For this reason,
+     * it's strongly recommended to treat the key pair as a read-only view of the keys. While it's still technically possible to alter their
+     * content, client code should never do so.
+     *
+     * @type {KeyPair | null}
      */
-    get keyPair(): KeyPair;
+    get keyPair(): KeyPair | null;
+    /**
+     * Returns the account's address, which is the owner's address (the EOA delegated through EIP-7702).
+     *
+     * @returns {Promise<string>} The account's address.
+     */
+    getAddress(): Promise<string>;
     /**
      * Signs a message.
      *
      * @param {string} message - The message to sign.
      * @returns {Promise<string>} The message's signature.
+     * @throws {DisposalError} If the account has been disposed.
      */
     sign(message: string): Promise<string>;
     /**
@@ -49,41 +131,94 @@ export default class WalletAccountEvm7702Gasless extends WalletAccountReadOnlyEv
      *
      * @param {TypedData} typedData - The typed data to sign.
      * @returns {Promise<string>} The typed data signature.
+     * @throws {DisposalError} If the account has been disposed.
      */
     signTypedData({ domain, types, message }: TypedData): Promise<string>;
+    /**
+     * Signs a transaction, producing a self-contained user operation that can later be broadcast
+     * with `sendTransaction` (or `quoteSendTransaction`'d) without any further owner interaction.
+     *
+     * The pre-signed EIP-7702 authorization is baked in when the EOA is not yet delegated to the
+     * configured address. Note that the nonce is fixed at sign time, so a signed operation must be
+     * broadcast before the account's nonce moves.
+     *
+     * If the transaction is not sponsored and `transactionMaxFee` is set, it also estimates the
+     * transaction's costs and checks them against that ceiling. The fee check and the signature
+     * always cover the same prepared user operation.
+     *
+     * @param {EvmTransaction | EvmTransaction[]} tx - The transaction, or an array of multiple transactions to send in batch.
+     * @param {Partial<Evm7702GaslessPaymasterTokenConfig | Evm7702GaslessSponsorshipPolicyConfig>} [config] - If set, overrides the given configuration options.
+     * @returns {Promise<UserOperationV8>} The signed user operation.
+     * @throws {Error} If the transaction is not sponsored, and the transaction's cost surpasses the transaction max. fee option.
+     * @throws {Error} If `nonceKey` is a bigint outside the uint192 range (0 to 2^192 - 1).
+     * @throws {DisposalError} If the account has been disposed.
+     */
+    signTransaction(tx: EvmTransaction | EvmTransaction[], config?: Partial<Evm7702GaslessPaymasterTokenConfig | Evm7702GaslessSponsorshipPolicyConfig>): Promise<UserOperationV8>;
     /**
      * Approves a specific amount of tokens to a spender.
      *
      * @param {ApproveOptions} options - The approve options.
      * @returns {Promise<TransactionResult>} The transaction's result.
      * @throws {Error} If trying to approve usdts on ethereum with allowance not equal to zero (due to the usdt allowance reset requirement).
+     * @throws {Error} If the transaction is not sponsored, and the transaction's cost surpasses the transaction max. fee option.
+     * @throws {DisposalError} If the account has been disposed.
      */
     approve(options: ApproveOptions): Promise<TransactionResult>;
     /**
-     * Quotes the costs of a send transaction operation. Caches the built user
-     * operation against the serialized transaction so that a subsequent
-     * sendTransaction call with the same tx can skip the gas-estimation +
-     * paymaster round-trip. Cache entries expire after 2 minutes.
+     * Quotes the costs of a send transaction operation. A quote never signs an
+     * EIP-7702 authorization: quoting is excluded from policy evaluation, so a real
+     * authorization signed here would never be seen by the policy engine. For an
+     * undelegated EOA the authorization is left unsigned (abstractionkit fills in
+     * placeholder signature fields) only so the bundler can simulate the account.
      *
-     * @param {EvmTransaction | EvmTransaction[]} tx - The transaction, or an array of multiple transactions to send in batch.
+     * When the EOA is already delegated no authorization is needed, and the built
+     * user operation is cached against the serialized transaction so that a subsequent
+     * sendTransaction / signTransaction / transfer call with the same tx can skip the
+     * gas-estimation + paymaster round-trip, after a lightweight on-chain nonce check that
+     * re-quotes only if the nonce has moved. Cache entries expire after 2 minutes. A quote
+     * built with a placeholder authorization is never cached, as it can never be reused for
+     * a send.
+     *
+     * An already-signed user operation (as returned by `signTransaction`) may also be passed; in that
+     * case its fee is read from its own gas fields (in token-paymaster mode this reflects the native
+     * gas ceiling, not the token amount) and no gas-estimation or paymaster round-trip is performed.
+     *
+     * @param {EvmTransaction | EvmTransaction[] | UserOperationV8} tx - The transaction, an array of multiple transactions to send in batch, or an already-signed user operation.
      * @param {Partial<Evm7702GaslessPaymasterTokenConfig | Evm7702GaslessSponsorshipPolicyConfig>} [config] - If set, overrides the given configuration options.
      * @returns {Promise<Omit<TransactionResult, 'hash'>>} The transaction's quotes.
      */
-    quoteSendTransaction(tx: EvmTransaction | EvmTransaction[], config?: Partial<Evm7702GaslessPaymasterTokenConfig | Evm7702GaslessSponsorshipPolicyConfig>): Promise<Omit<TransactionResult, "hash">>;
+    quoteSendTransaction(tx: EvmTransaction | EvmTransaction[] | UserOperationV8, config?: Partial<Evm7702GaslessPaymasterTokenConfig | Evm7702GaslessSponsorshipPolicyConfig>): Promise<Omit<TransactionResult, "hash">>;
     /**
      * Sends a transaction.
      *
-     * @param {EvmTransaction | EvmTransaction[]} tx - The transaction, or an array of multiple transactions to send in batch.
+     * If the transaction is not sponsored, it also estimates the transaction's costs and checks them
+     * against the transaction max. fee option. The fee check and the signature always cover the same
+     * prepared user operation.
+     *
+     * An already-signed user operation (as returned by `signTransaction`) may also be passed; in that
+     * case it is broadcast directly to the bundler, reusing the nonce and EIP-7702 authorization baked
+     * in at sign time. The max-fee check is skipped here: token-paymaster fees cannot be reconstructed
+     * from a signed user operation (`_getSignedUserOperationFee` returns native wei, while
+     * `transactionMaxFee` is in paymaster-token units), so the ceiling only applies when this wallet
+     * builds/signs the operation with `transactionMaxFee` configured.
+     *
+     * @param {EvmTransaction | EvmTransaction[] | UserOperationV8} tx - The transaction, an array of multiple transactions to send in batch, or an already-signed user operation.
      * @param {Partial<Evm7702GaslessPaymasterTokenConfig | Evm7702GaslessSponsorshipPolicyConfig>} [config] - If set, overrides the given configuration options.
      * @returns {Promise<TransactionResult>} The transaction's result.
+     * @throws {Error} If the transaction is not sponsored, and the transaction's cost surpasses the transaction max. fee option.
+     * @throws {Error} If `nonceKey` is a bigint outside the uint192 range (0 to 2^192 - 1).
+     * @throws {DisposalError} If the account has been disposed.
      */
-    sendTransaction(tx: EvmTransaction | EvmTransaction[], config?: Partial<Evm7702GaslessPaymasterTokenConfig | Evm7702GaslessSponsorshipPolicyConfig>): Promise<TransactionResult>;
+    sendTransaction(tx: EvmTransaction | EvmTransaction[] | UserOperationV8, config?: Partial<Evm7702GaslessPaymasterTokenConfig | Evm7702GaslessSponsorshipPolicyConfig>): Promise<TransactionResult>;
     /**
      * Transfers a token to another address.
      *
      * @param {EvmTransferOptions} options - The transfer's options.
      * @param {Partial<Evm7702GaslessPaymasterTokenConfig | Evm7702GaslessSponsorshipPolicyConfig>} [config] - If set, overrides the given configuration options.
      * @returns {Promise<TransferResult>} The transfer's result.
+     * @throws {Error} If the estimated fee meets or exceeds the configured `transferMaxFee`.
+     * @throws {Error} If `nonceKey` is a bigint outside the uint192 range (0 to 2^192 - 1).
+     * @throws {DisposalError} If the account has been disposed.
      */
     transfer(options: EvmTransferOptions, config?: Partial<Evm7702GaslessPaymasterTokenConfig | Evm7702GaslessSponsorshipPolicyConfig>): Promise<TransferResult>;
     /**
@@ -97,29 +232,40 @@ export default class WalletAccountEvm7702Gasless extends WalletAccountReadOnlyEv
      */
     dispose(): void;
     /** @private */
+    private _guardDisposed;
+    /** @private */
+    private _isDelegatedTo;
+    /** @private */
+    private _getQuoteAuthorization;
+    /** @private */
     private _getAuthorization;
     /** @private */
+    private _prepareForSend;
+    /** @private */
+    private _signPreparedUserOperation;
+    /** @private */
     private _sendUserOperation;
+    /**
+     * Broadcasts an already-signed user operation directly to the bundler.
+     *
+     * @private
+     * @param {UserOperationV8} userOp - The signed user operation.
+     * @returns {Promise<string>} The user operation hash.
+     */
+    private _broadcastSignedUserOperation;
+    /** @private */
+    private _consumeFreshQuote;
+    /** @private */
+    private _resolveNonce;
     /** @private */
     private _consumeCachedQuote;
     /** @private */
     private _sweepExpiredQuotes;
-    /** @private */
-    private static _getTxKey;
-    private _evm7702GaslessReadOnlyAccount;
-    /**
-     * Cache of recently-quoted transactions keyed by their serialized tx (see _getTxKey).
-     * sendTransaction and transfer consume an entry to skip the gas-estimation +
-     * paymaster round-trip when the same tx was just quoted. Entries expire after
-     * QUOTE_CACHE_TTL_MS; expired entries are swept on insert.
-     *
-     * @private
-     * @type {Map<string, TransactionQuote>}
-     */
-    private _quoteCache: Map<string, TransactionQuote>;
 }
 export type IWalletAccount = import("@tetherto/wdk-wallet").IWalletAccount;
 export type KeyPair = import("@tetherto/wdk-wallet-evm").KeyPair;
+export type ISignerEvm = import("@tetherto/wdk-wallet-evm/signers").ISignerEvm;
+export type SignerOptions = import("@tetherto/wdk-wallet-evm").SignerOptions;
 export type EvmTransaction = import("@tetherto/wdk-wallet-evm").EvmTransaction;
 export type TransactionResult = import("@tetherto/wdk-wallet-evm").TransactionResult;
 export type EvmTransferOptions = import("@tetherto/wdk-wallet-evm").EvmTransferOptions;
@@ -127,6 +273,10 @@ export type TransferResult = import("@tetherto/wdk-wallet-evm").TransferResult;
 export type ApproveOptions = import("@tetherto/wdk-wallet-evm").ApproveOptions;
 export type UserOperationV8 = import("abstractionkit").UserOperationV8;
 export type TokenQuote = import("abstractionkit").TokenQuote;
+export type Evm7702GaslessWalletConfig = import("./wallet-account-read-only-evm-7702-gasless.js").Evm7702GaslessWalletConfig;
+export type Evm7702GaslessPaymasterTokenConfig = import("./wallet-account-read-only-evm-7702-gasless.js").Evm7702GaslessPaymasterTokenConfig;
+export type Evm7702GaslessSponsorshipPolicyConfig = import("./wallet-account-read-only-evm-7702-gasless.js").Evm7702GaslessSponsorshipPolicyConfig;
+export type TypedData = import("./wallet-account-read-only-evm-7702-gasless.js").TypedData;
 export type TransactionQuote = {
     /**
      * - The estimated fee.
@@ -145,9 +295,5 @@ export type TransactionQuote = {
      */
     tokenQuote?: TokenQuote;
 };
-export type Evm7702GaslessWalletConfig = import("./wallet-account-read-only-evm-7702-gasless.js").Evm7702GaslessWalletConfig;
-export type Evm7702GaslessPaymasterTokenConfig = import("./wallet-account-read-only-evm-7702-gasless.js").Evm7702GaslessPaymasterTokenConfig;
-export type Evm7702GaslessSponsorshipPolicyConfig = import("./wallet-account-read-only-evm-7702-gasless.js").Evm7702GaslessSponsorshipPolicyConfig;
-export type TypedData = import("./wallet-account-read-only-evm-7702-gasless.js").TypedData;
 import WalletAccountReadOnlyEvm7702Gasless from './wallet-account-read-only-evm-7702-gasless.js';
 import { WalletAccountEvm } from '@tetherto/wdk-wallet-evm';

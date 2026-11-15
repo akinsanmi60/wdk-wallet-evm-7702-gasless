@@ -2,25 +2,27 @@
 
 **Note**: This package is currently in beta. Please test thoroughly in development environments before using in production.
 
-A simple and secure package to manage gasless EIP-7702 wallets for EVM-compatible blockchains. This package abstracts all EIP-7702 delegation and ERC-4337 UserOperation complexity behind a simple API — call `transfer()` and delegation, UserOp signing, paymaster sponsorship, and token approvals all happen internally.
+An [EIP-7702 wallet module](https://docs.wdk.tether.io/sdk/wallet-modules/wallet-evm-7702-gasless/) for gasless account abstraction on EVM-compatible blockchains, part of WDK (Wallet Development Kit) by Tether. This package abstracts all EIP-7702 delegation and ERC-4337 UserOperation complexity behind a simple API — call `transfer()` and delegation, UserOp signing, paymaster sponsorship, and token approvals all happen internally.
 
 ## About WDK
 
-This module is part of the [**WDK (Wallet Development Kit)**](https://wallet.tether.io/) project, which empowers developers to build secure, non-custodial wallets with unified blockchain access, stateless architecture, and complete user control.
+This module is part of the [**WDK (Wallet Development Kit)**](https://docs.wdk.tether.io/) project, which empowers developers to build secure, non-custodial wallets with unified blockchain access, stateless architecture, and complete user control.
 
-For detailed documentation about the complete WDK ecosystem, visit [docs.wallet.tether.io](https://docs.wallet.tether.io).
+For detailed documentation about the complete WDK ecosystem, visit [docs.wdk.tether.io](https://docs.wdk.tether.io/).
 
 ## Features
 
 - **EIP-7702 Delegation**: EOA becomes a smart account via delegation — no Safe contract, no address prediction
 - **Gasless Transactions**: Full paymaster integration for sponsored or ERC-20 token gas payment
 - **Auto Approval**: Paymaster token allowance is managed automatically, including USDT mainnet reset handling
-- **Provider-Agnostic**: Works with any ERC-4337 bundler/paymaster (Pimlico, Candide, etc.)
+- **Provider-Agnostic**: Works with any ERC-4337 bundler/paymaster (Candide, Pimlico, etc.)
+- **Failover Providers**: Pass an array of provider URLs or EIP-1193 instances to enable automatic round-robin failover
 - **Bare Runtime**: Supports both Node.js and [Bare](https://github.com/nicolo-ribaudo/bare) runtime
 - **EVM Derivation Paths**: Support for BIP-44 standard derivation paths for Ethereum (m/44'/60')
 - **Multi-Account Management**: Create and manage multiple wallets from a single seed phrase
 - **ERC20 Support**: Query native token and ERC20 token balances, transfers, and approvals
 - **Automatic Delegation Lifecycle**: Delegation is checked and signed automatically per operation
+- **Pluggable Signers**: Use a seed phrase, a derivable signer, or a private-key signer as the account's owner
 
 ## Installation
 
@@ -30,6 +32,11 @@ npm install @tetherto/wdk-wallet-evm-7702-gasless
 
 ## Quick Start
 
+The examples below use [Candide](https://dashboard.candide.dev) as the bundler and paymaster. Candide serves both from a single unified URL, so only `bundlerUrl` is needed — the paymaster is reached at the same endpoint, and the chain is selected by its chain ID in the path:
+
+- Public: `https://api.candide.dev/public/v3/{chainId}` — rate-limited, no key required
+- Authenticated: `https://api.candide.dev/api/v3/{chainId}/{apiKey}` — API key from the dashboard, for your own gas policies and higher rate limits
+
 ### Creating a Wallet (Sponsored Mode)
 
 ```javascript
@@ -38,9 +45,9 @@ import WalletManagerEvm7702Gasless from '@tetherto/wdk-wallet-evm-7702-gasless'
 const wallet = new WalletManagerEvm7702Gasless(seedPhrase, {
   provider: 'https://rpc.mevblocker.io/fast',
   delegationAddress: '0xe6Cae83BdE06E4c305530e199D7217f42808555B',
-  bundlerUrl: 'https://api.pimlico.io/v2/1/rpc?apikey=YOUR_KEY',
+  bundlerUrl: 'https://api.candide.dev/api/v3/1/YOUR_API_KEY',
   isSponsored: true,
-  sponsorshipPolicyId: 'sp_my_policy'
+  sponsorshipPolicyId: 'your_policy_id'
 })
 
 const account = await wallet.getAccount(0)
@@ -53,27 +60,45 @@ const address = await account.getAddress() // Returns the EOA address directly
 const wallet = new WalletManagerEvm7702Gasless(seedPhrase, {
   provider: 'https://rpc.mevblocker.io/fast',
   delegationAddress: '0xe6Cae83BdE06E4c305530e199D7217f42808555B',
-  bundlerUrl: 'https://api.pimlico.io/v2/1/rpc?apikey=YOUR_KEY',
-  paymasterAddress: '0x888888888888Ec68A58AB8094Cc1AD20Ba3D2402',
+  bundlerUrl: 'https://api.candide.dev/api/v3/1/YOUR_API_KEY',
+  paymasterAddress: '0xa8151918eac3818deb713d3dbbb7930329fe86ed', // Candide, Ethereum mainnet, EntryPoint v0.8
   paymasterToken: { address: '0xdAC17F958D2ee523a2206206994597C13D831ec7' }, // USDT
-  transferMaxFee: 100000000000000n
+  transferMaxFee: 100000n, // 0.1 USDT, in the paymaster token's base units
+  transactionMaxFee: 100000n
 })
 ```
 
-### Using Candide (Separate Paymaster Endpoint)
+### Using Pimlico
 
-Candide uses separate bundler and paymaster URLs. Use the `paymasterUrl` field:
+Pimlico is the tested alternative. One URL serves both the bundler and the paymaster, with the API key in the query string.
+
+In sponsored mode, only the endpoint and the policy ID change from the Candide example:
 
 ```javascript
 const wallet = new WalletManagerEvm7702Gasless(seedPhrase, {
   provider: 'https://rpc.mevblocker.io/fast',
   delegationAddress: '0xe6Cae83BdE06E4c305530e199D7217f42808555B',
-  bundlerUrl: 'https://api.candide.dev/bundler/v3/1/YOUR_KEY',
-  paymasterUrl: 'https://api.candide.dev/paymaster/v3/1/YOUR_KEY',
+  bundlerUrl: 'https://api.pimlico.io/v2/1/rpc?apikey=YOUR_KEY',
   isSponsored: true,
-  sponsorshipPolicyId: 'your_policy_id'
+  sponsorshipPolicyId: 'sp_your_policy_id'
 })
 ```
+
+In paymaster token mode, Pimlico's token paymaster contract differs from Candide's:
+
+```javascript
+const wallet = new WalletManagerEvm7702Gasless(seedPhrase, {
+  provider: 'https://rpc.mevblocker.io/fast',
+  delegationAddress: '0xe6Cae83BdE06E4c305530e199D7217f42808555B',
+  bundlerUrl: 'https://api.pimlico.io/v2/1/rpc?apikey=YOUR_KEY',
+  paymasterAddress: '0x888888888888Ec68A58AB8094Cc1AD20Ba3D2402', // Pimlico, Ethereum mainnet, EntryPoint v0.8
+  paymasterToken: { address: '0xdAC17F958D2ee523a2206206994597C13D831ec7' }, // USDT
+  transferMaxFee: 100000n, // 0.1 USDT, in the paymaster token's base units
+  transactionMaxFee: 100000n
+})
+```
+
+In token-paymaster mode, `paymasterAddress` is required and specific to a provider, chain and EntryPoint version. The wallet checks that the address returned by the paymaster RPC matches this configured address before signing. Confirm the expected contract with your provider.
 
 ### Wrapping an Existing WalletAccountEvm
 
@@ -90,6 +115,36 @@ const gaslessAccount = new WalletAccountEvm7702Gasless(evmAccount, {
   isSponsored: true
 })
 ```
+
+The wrapped `WalletAccountEvm` is not disposed when the gasless account is disposed.
+
+### Using Signers
+
+The account's owner can be any evm signer, not just a seed phrase. The signers are re-exported from `@tetherto/wdk-wallet-evm-7702-gasless/signers`, so you don't need to install `@tetherto/wdk-wallet-evm` yourself.
+
+```javascript
+import WalletManagerEvm7702Gasless, { WalletAccountEvm7702Gasless } from '@tetherto/wdk-wallet-evm-7702-gasless'
+import { PrivateKeySignerEvm, SeedSignerEvm } from '@tetherto/wdk-wallet-evm-7702-gasless/signers'
+
+// The default signer must be derivable.
+const wallet = new WalletManagerEvm7702Gasless(new SeedSignerEvm(seedPhrase, "m/44'/60'"), config)
+
+// Other signers are registered by name.
+wallet.addSigner('treasury', new PrivateKeySignerEvm(privateKey))
+const treasury = await wallet.getAccount('treasury')
+
+// A derivable signer registered by name derives accounts below its own path.
+wallet.addSigner('bank', new SeedSignerEvm(otherSeedPhrase, "m/44'/60'"))
+const bankAccount = await wallet.getAccount(0, { signerName: 'bank' })
+
+// Standalone accounts, without a wallet manager.
+const account = WalletAccountEvm7702Gasless.fromPrivateKey(privateKey, config)
+```
+
+**Notes:**
+- A wallet created from a seed wipes its default signer on `dispose()`. Signers you supply are never wiped by the wallet, and an account wipes a signer you give it only with `shouldWipeSignerOnDisposal: true`.
+- The account's address is resolved from the signer's `getAddress()` on first use, so signers that only provide their address asynchronously (e.g. hardware signers) are supported.
+- `account.path` and `account.keyPair` are `null` for signers without a derivation path or key material.
 
 ### Managing Multiple Accounts
 
@@ -159,6 +214,32 @@ const quote = await account.quoteSendTransaction({
 })
 ```
 
+### Concurrent / Parallel Sends (nonce lanes)
+
+By default every send uses the account's key-0 nonce, so it is sequential — a second send fired before the first is mined would collide on the nonce. To send independent operations concurrently, put each in its own **nonce lane** (an ERC-4337 two-dimensional nonce: a 192-bit `key` with its own sequence). Ops in different keys have no ordering constraint and validate independently, so they can be submitted at the same time.
+
+```javascript
+// parallel: true → each send gets a fresh random lane (sequence 0). Fire them together:
+const [a, b] = await Promise.all([
+  account.sendTransaction({ to: '0x...', value: 0n, data: '0x' }, { parallel: true }),
+  account.sendTransaction({ to: '0x...', value: 0n, data: '0x' }, { parallel: true })
+])
+
+// nonceKey: a string is a reusable named lane (same label resumes the same lane across sessions);
+// a bigint is used as the raw uint192 key. Same key = ordered; different keys = parallel.
+await account.sendTransaction(tx, { nonceKey: 'payments' })
+await account.sendTransaction(tx, { nonceKey: 1n })
+```
+
+Both options can also be set at construction (`new WalletManagerEvm7702Gasless(seed, { ..., parallel: true })`) and overridden per call. Precedence: `nonceKey` > `parallel` > default (key 0).
+
+**Notes:**
+- **Requires a bundler that accepts parallel keys** (Candide and Pimlico both do). There is no SDK-side lane limit; respect your bundler's cap (e.g. Pimlico allows up to 100 parallel).
+- **Per-sender mempool cap (≈4).** Per [ERC-7562](https://eips.ethereum.org/EIPS/eip-7562), a standard bundler mempool holds at most **4** in-flight UserOperations from a single sender at once (`SAME_SENDER_MEMPOOL_COUNT = 4`). Firing more than 4 lanes concurrently may be rejected until earlier ops are mined. This is a mempool validation limit, separate from parallel-key support, and can be raised by the bundler operator if needed.
+- **Delegate first.** The first UserOperation from a fresh account carries the EIP-7702 delegation authorization, which is tied to the account's EOA nonce. Let one send land (delegating the account) before firing concurrent lanes, so parallel sends don't race on the initial delegation.
+- `parallel: true` mints a **new** EntryPoint nonce slot per send (a one-time gas cost per lane, paid by the paymaster; permanent state). For repeated parallel workloads, reuse a fixed set of lanes with `nonceKey` labels instead of a fresh key every time.
+- A single lane is still **sequential**. Two concurrent sends sharing the same `nonceKey` collide on the sequence: the second is typically still **accepted by the bundler and returns a hash, yet can never mine** — its hash never resolves to a receipt and no error is thrown (a silent phantom hash). To run operations concurrently, give each its **own lane** (`parallel: true`, or distinct `nonceKey`s). If operations must share a lane, either **await each send's receipt before firing the next**, or **batch them into a single UserOperation** by passing an array to `sendTransaction([tx1, tx2, ...])` — batched calls execute atomically, in order, under one nonce.
+
 ### Token Approvals
 
 ```javascript
@@ -217,15 +298,43 @@ wallet.dispose()  // Dispose all accounts
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `provider` | `string \| Eip1193Provider` | RPC endpoint URL or EIP-1193 provider instance |
+| `provider` | `string \| Eip1193Provider \| (string \| Eip1193Provider)[]` | RPC endpoint URL, EIP-1193 provider instance, or failover list mixing both formats |
 | `bundlerUrl` | `string` | URL of the ERC-4337 bundler service |
-| `delegationAddress` | `string` | Address of the smart account implementation to delegate to |
+| `delegationAddress` | `string` | Address of the smart account implementation to delegate to. Must be an implementation built for the configured `entryPointVersion` |
 
 ### Optional Common Fields
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `paymasterUrl` | `string` | URL of the paymaster service, if different from `bundlerUrl` (e.g. Candide) |
+| `paymasterUrl` | `string` | URL of the paymaster service, when it differs from `bundlerUrl`. Omit when one URL serves both the bundler and paymaster (e.g. Candide, Pimlico) |
+| `retries` | `number` | Additional retry attempts for provider failover arrays. Total attempts are `1 + retries`. Defaults to `3` |
+| `chainId` | `number` | When set, UserOperation build and sign assert the provider reports this chain and throw `ConfigurationError` on mismatch. When omitted, the provider's chain is trusted |
+| `entryPointVersion` | `'0.8' \| '0.9'` | ERC-4337 EntryPoint version the account operates under. Selects the EntryPoint address and the matching account implementation together. Defaults to `'0.8'` |
+
+### EntryPoint Version
+
+The account runs on ERC-4337 EntryPoint **v0.8 by default**. Set `entryPointVersion` to `'0.9'` to target a bundler/paymaster that serves EntryPoint v0.9 instead:
+
+```javascript
+const wallet = new WalletManagerEvm7702Gasless(seedPhrase, {
+  provider: 'https://eth.llamarpc.com',
+  bundlerUrl: 'https://your-bundler.example/rpc',
+  entryPointVersion: '0.9',
+  delegationAddress: '0xa46cc63eBF4Bd77888AA327837d20b23A63a56B5',
+  isSponsored: true
+})
+```
+
+`entryPointVersion` selects the EntryPoint address and the account implementation together. The implementation fixes the EIP-712 signing domain, while the EntryPoint address is where nonces are read and user operations are submitted, so the two are never configured independently.
+
+| Version | EntryPoint | Reference `delegationAddress` |
+|---------|------------|-------------------------------|
+| `'0.8'` (default) | `0x4337084D9E255Ff0702461CF8895CE9E3b5Ff108` | `0xe6Cae83BdE06E4c305530e199D7217f42808555B` |
+| `'0.9'` | `0x433709009B8330FDa32311DF1C2AFA402eD8D009` | `0xa46cc63eBF4Bd77888AA327837d20b23A63a56B5` |
+
+A delegation implementation only accepts user operations from the EntryPoint it was built for, so pairing one version's reference implementation with the other version is rejected at construction with a `ConfigurationError`. A custom `delegationAddress` is accepted on either version and is not verified — check yourself that it targets the configured EntryPoint.
+
+Omitting `entryPointVersion` preserves the previous behavior exactly: the same EntryPoint, delegation implementation, signatures and nonces as before the option existed.
 
 ### Sponsored Mode
 
@@ -238,9 +347,10 @@ wallet.dispose()  // Dispose all accounts
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `paymasterAddress` | `string` (optional) | Pin on the paymaster smart contract address. When omitted, it is derived from the paymaster RPC (`pm_supportedERC20Tokens` for Candide, `pimlico_getTokenQuotes` for Pimlico) |
+| `paymasterAddress` | `string` (required for token-paymaster mode) | Paymaster smart contract address. The RPC response must match this pin before the wallet signs. |
 | `paymasterToken` | `{ address: string }` | ERC-20 token used for gas payment |
 | `transferMaxFee` | `number \| bigint` (optional) | Maximum fee for transfer operations |
+| `transactionMaxFee` | `number \| bigint` (optional) | Maximum fee for sendTransaction and signTransaction operations |
 
 ## API Reference
 
@@ -250,8 +360,10 @@ The main class for managing EIP-7702 gasless wallets. Extends `WalletManager` fr
 
 | Method | Description | Returns |
 |--------|-------------|---------|
-| `getAccount(index)` | Returns a wallet account at the specified index | `Promise<WalletAccountEvm7702Gasless>` |
-| `getAccountByPath(path)` | Returns a wallet account at the specified BIP-44 derivation path | `Promise<WalletAccountEvm7702Gasless>` |
+| `getAccount(index, options?)` | Returns a wallet account at the specified index, optionally below the signer named by `options.signerName` | `Promise<WalletAccountEvm7702Gasless>` |
+| `getAccount(signerName)` | Returns the wallet account of a signer registered via `addSigner`, used as given without deriving | `Promise<WalletAccountEvm7702Gasless>` |
+| `getAccountByPath(path, options?)` | Returns a wallet account at the specified BIP-44 derivation path, optionally below the signer named by `options.signerName` | `Promise<WalletAccountEvm7702Gasless>` |
+| `addSigner(signerName, signer)` | Registers a signer by name | `this` |
 | `getFeeRates()` | Returns current fee rates | `Promise<{normal: bigint, fast: bigint}>` |
 | `dispose()` | Disposes all wallet accounts, clearing private keys from memory | `void` |
 
@@ -261,7 +373,12 @@ Individual gasless wallet account. Extends `WalletAccountReadOnlyEvm7702Gasless`
 
 **Constructor overloads:**
 - `new WalletAccountEvm7702Gasless(seed, path, config)` — standard BIP-44 derivation
-- `new WalletAccountEvm7702Gasless(walletAccountEvm, config)` — wrap an existing `WalletAccountEvm`
+- `new WalletAccountEvm7702Gasless(seed, config)` — derivation at the default path `m/44'/60'/0'/0/0`
+- `new WalletAccountEvm7702Gasless(signer, config)` — use an evm signer (wiped on `dispose()` only with `shouldWipeSignerOnDisposal: true`)
+- `new WalletAccountEvm7702Gasless(walletAccountEvm, config)` — wrap an existing `WalletAccountEvm` (not disposed on `dispose()`)
+
+**Static methods:**
+- `WalletAccountEvm7702Gasless.fromPrivateKey(privateKey, config)` — use a raw private key, wiped on `dispose()`
 
 | Method | Description | Returns |
 |--------|-------------|---------|
@@ -286,9 +403,8 @@ Individual gasless wallet account. Extends `WalletAccountReadOnlyEvm7702Gasless`
 
 | Property | Type | Description |
 |----------|------|-------------|
-| `index` | `number` | The derivation path's index |
-| `path` | `string` | The full derivation path |
-| `keyPair` | `KeyPair` | The account's key pair |
+| `path` | `string \| null` | The full derivation path, or `null` for signers without one |
+| `keyPair` | `KeyPair \| null` | The account's key pair, or `null` for signers without key material |
 
 ### WalletAccountReadOnlyEvm7702Gasless
 
@@ -337,8 +453,8 @@ This module uses standard ERC-4337 bundler RPCs (`eth_sendUserOperation`, `eth_e
 
 | Provider | Sponsored | Paymaster Token | Status |
 |----------|-----------|-----------------|--------|
+| **Candide** (default in the examples) | Yes | Yes | Fully working — earlier gas-estimation issues fixed upstream (re-validated 2026-08) |
 | **Pimlico** | Yes | Yes | Fully working — all flows tested on mainnet and Sepolia |
-| **Candide** | Yes | Yes | Working with known limitations (see below) |
 
 ### Not Compatible
 
@@ -348,32 +464,13 @@ This module uses standard ERC-4337 bundler RPCs (`eth_sendUserOperation`, `eth_e
 | **ZeroDev** | Locked to Kernel smart account — requires `createKernelAccount`, not standard `toSimpleSmartAccount` |
 | **Gelato** | Proprietary Smart Wallet SDK — no standard bundler RPCs exposed |
 
-### Known Candide Limitations
-
-Candide's Voltaire bundler has known gas estimation issues affecting EIP-7702 accounts. These are bundler-side bugs, not module issues — the same operations work correctly on Pimlico.
-
-**1. `callGasLimit` underestimation for USDT on Ethereum mainnet**
-
-The bundler returns ~27k `callGasLimit` for USDT transfers, but USDT's non-standard implementation needs ~40k+. The UserOp inner call reverts with empty reason data (out of gas). Standard ERC-20 tokens (USDC, DAI) are not affected.
-
-**2. `verificationGasLimit` underestimation for ERC-20 paymaster**
-
-The bundler's gas estimate doesn't meet its own validation margin. Error: "verificationGas should have extra 2000 gas, has only -15791". Observed on Sepolia with the ERC-20 token paymaster flow.
-
-**Related Candide GitHub issues:**
-- [abstractionkit #57](https://github.com/candidelabs/abstractionkit/issues/57): Gas estimation ran before approval was prepended, producing wrong estimates
-- [abstractionkit #78](https://github.com/candidelabs/abstractionkit/issues/78) (open): Simple7702Account ignoring paymaster fields in overrides
-- [voltaire #33](https://github.com/candidelabs/voltaire/issues/33): Gas estimation failed for IAccountExecute accounts on EntryPoint v0.8
-
-**Recommendation:** Use Pimlico for production deployments until Candide resolves these estimation issues. If using Candide, the paymaster-token flow on Ethereum mainnet works reliably; the sponsored flow works for ETH transfers and standard ERC-20 tokens but may fail for USDT.
-
 ## Security Considerations
 
 - **Seed Phrase Security**: Always store your seed phrase securely and never share it
 - **Private Key Management**: The package handles private keys internally via memory-safe buffers (`Uint8Array`) that are zeroed on `dispose()`
 - **Memory Cleanup**: Use the `dispose()` method to clear private keys from memory when done
-- **Fee Limits**: Set `transferMaxFee` to prevent excessive transaction fees
-- **Delegation Awareness**: The EOA delegates execution to a smart account implementation — verify the `delegationAddress` is trusted and audited
+- **Fee Limits**: Set `transferMaxFee` and `transactionMaxFee` to prevent excessive transaction fees
+- **Delegation Awareness**: The EOA delegates execution to a smart account implementation — verify the `delegationAddress` is trusted and audited, and that it is built for the configured `entryPointVersion`
 - **Bundler Security**: Use trusted bundler services and validate UserOperation responses
 - **Contract Interactions**: Verify contract addresses and token decimals before transfers
 

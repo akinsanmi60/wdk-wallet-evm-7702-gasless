@@ -4,6 +4,7 @@ export { default as WalletAccountEvm7702Gasless } from "./src/wallet-account-evm
 export { ConfigurationError } from "./src/errors.js";
 export type FeeRates = import("@tetherto/wdk-wallet-evm").FeeRates;
 export type KeyPair = import("@tetherto/wdk-wallet-evm").KeyPair;
+export type SignerOptions = import("@tetherto/wdk-wallet-evm").SignerOptions;
 export type EvmTransaction = import("@tetherto/wdk-wallet-evm").EvmTransaction;
 export type TransactionResult = import("@tetherto/wdk-wallet-evm").TransactionResult;
 export type EvmTransferOptions = import("@tetherto/wdk-wallet-evm").EvmTransferOptions;
@@ -13,6 +14,10 @@ export type ApproveOptions = import("@tetherto/wdk-wallet-evm").ApproveOptions;
 export type TypedData = import("@tetherto/wdk-wallet-evm").TypedData;
 export type TypedDataDomain = import("@tetherto/wdk-wallet-evm").TypedDataDomain;
 export type TypedDataField = import("@tetherto/wdk-wallet-evm").TypedDataField;
+export type Finality = import("@tetherto/wdk-wallet").Finality;
+export type TransactionReceipt = import("@tetherto/wdk-wallet").TransactionReceipt;
+export type WaitForTransactionTarget = import("@tetherto/wdk-wallet").WaitForTransactionTarget;
+export type WaitForTransactionOptions = import("@tetherto/wdk-wallet").WaitForTransactionOptions;
 export type Evm7702GaslessWalletConfig = import("./src/wallet-manager-evm-7702-gasless.js").Evm7702GaslessWalletConfig;
 export type Evm7702GaslessWalletCommonConfig = import("./src/wallet-account-read-only-evm-7702-gasless.js").Evm7702GaslessWalletCommonConfig;
 export type Evm7702GaslessPaymasterTokenConfig = import("./src/wallet-account-read-only-evm-7702-gasless.js").Evm7702GaslessPaymasterTokenConfig;
@@ -21,3 +26,4 @@ export type UserOperationReceipt = import("./src/wallet-account-read-only-evm-77
 export type Eip7702AuthorizationOverride = import("./src/wallet-account-read-only-evm-7702-gasless.js").Eip7702AuthorizationOverride;
 export type BuildSponsoredUserOperationOverrides = import("./src/wallet-account-read-only-evm-7702-gasless.js").BuildSponsoredUserOperationOverrides;
 export type SponsoredUserOperation = import("./src/wallet-account-read-only-evm-7702-gasless.js").SponsoredUserOperation;
+export type Evm7702GaslessTransactionDetails = import("./src/wallet-account-read-only-evm-7702-gasless.js").Evm7702GaslessTransactionDetails;

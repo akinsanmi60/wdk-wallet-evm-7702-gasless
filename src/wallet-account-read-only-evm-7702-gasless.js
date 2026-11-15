@@ -14,7 +14,9 @@
 
 'use strict'
 
-import { WalletAccountReadOnly } from '@tetherto/wdk-wallet'
+import { isError, isHexString, BrowserProvider, JsonRpcProvider } from 'ethers'
+
+import { WalletAccountReadOnly, NoSuchElementError, ValueError } from '@tetherto/wdk-wallet'
 
 import { WalletAccountReadOnlyEvm } from '@tetherto/wdk-wallet-evm'
 
@@ -22,13 +24,18 @@ import {
   AbstractionKitError,
   Bundler,
   ENTRYPOINT_V8,
+  ENTRYPOINT_V9,
   Erc7677Paymaster,
   Simple7702Account,
+  Simple7702AccountV09,
   sendJsonRpcRequest
 } from 'abstractionkit'
 
+import FailoverProvider from '@tetherto/wdk-failover-provider'
+
 import { ConfigurationError } from './errors.js'
 
+/** @typedef {import('ethers').Provider} Provider */
 /** @typedef {import('ethers').Eip1193Provider} Eip1193Provider */
 
 /** @typedef {import('@tetherto/wdk-wallet-evm').EvmTransaction} EvmTransaction */
@@ -44,19 +51,32 @@ import { ConfigurationError } from './errors.js'
 /** @typedef {import('abstractionkit').UserOperationReceiptResult} UserOperationReceipt */
 /** @typedef {import('abstractionkit').TokenQuote} TokenQuote */
 
+/** @typedef {import('@tetherto/wdk-wallet').TransactionReceipt} TransactionReceipt */
+/** @typedef {import('@tetherto/wdk-wallet').WaitForTransactionOptions} WaitForTransactionOptions */
+
+/**
+ * The EVM 7702 gasless-specific fields added to a normalized transaction receipt.
+ *
+ * @typedef {Object} Evm7702GaslessTransactionDetails
+ * @property {number} confirmations - The number of confirmations (0 while pending or dropped).
+ * @property {EvmTransactionReceipt | null} receipt - The native ethers receipt of the bundling transaction, or null while the user operation is pending or dropped.
+ * @property {UserOperationReceipt | null} userOperationReceipt - The user operation receipt, or null while the user operation is pending or its receipt is not yet available.
+ */
+
 /**
  * @typedef {Object} Eip7702AuthorizationOverride
- * @property {bigint} chainId - The chain id the authorization was signed for.
+ * @property {bigint} chainId - The chain id the authorization is for.
  * @property {string} address - The delegate contract address (the EOA's new code).
- * @property {bigint} nonce - The EOA's transaction nonce at signing time.
- * @property {string} yParity - The y-parity bit of the signature, encoded as `'0x0'` or `'0x1'`.
- * @property {string} r - The r component of the ECDSA signature (32-byte hex).
- * @property {string} s - The s component of the ECDSA signature (32-byte hex).
+ * @property {bigint} [nonce] - The EOA's transaction nonce at signing time. Omit it, together with the signature fields, for an unsigned authorization.
+ * @property {string} [yParity] - The y-parity bit of the signature, encoded as `'0x0'` or `'0x1'`.
+ * @property {string} [r] - The r component of the ECDSA signature (32-byte hex).
+ * @property {string} [s] - The s component of the ECDSA signature (32-byte hex).
  */
 
 /**
  * @typedef {Object} BuildSponsoredUserOperationOverrides
- * @property {Eip7702AuthorizationOverride} [eip7702Auth] - Pre-signed EIP-7702 authorization tuple to include in the user operation.
+ * @property {Eip7702AuthorizationOverride} [eip7702Auth] - EIP-7702 authorization tuple to include in the user operation. Pre-signed, or unsigned (no `nonce`, `yParity`, `r` or `s`) when the operation is only used to estimate gas, in which case abstractionkit fills in placeholders.
+ * @property {bigint} [nonce] - Explicit EntryPoint nonce for the user operation. When omitted, the account derives it from the on-chain nonce.
  */
 
 /**
@@ -74,10 +94,15 @@ import { ConfigurationError } from './errors.js'
 
 /**
  * @typedef {Object} Evm7702GaslessWalletCommonConfig
- * @property {string | Eip1193Provider} provider - The url of the rpc provider, or an instance of a class that implements eip-1193.
+ * @property {string | Provider | Eip1193Provider | (string | Provider | Eip1193Provider)[]} provider - The url of the rpc provider, an already-built ethers `Provider` (reused as-is), or an instance of a class that implements eip-1193. It's also possible to provide an array of these instead. In such case, connection errors will cause the wallet to automatically fallback on the next provider in the list.
+ * @property {number} [chainId] - The chain id the wallet operates on (e.g. 1 for ethereum). When set, every UserOperation build asserts the provider reports this chain and throws `ConfigurationError` on mismatch before anything is built or signed; the underlying read-only account also pins to a static network, skipping per-call chain detection. When omitted, the provider's reported chain is trusted.
+ * @property {number} [retries] - If set and if 'provider' is a list of urls or EIP 1193 providers, the number of additional retry attempts after the initial call fails. Total attempts = `1 + retries`. For example, `retries: 3` with 4 providers will try each provider once before throwing. If `retries` exceeds the number of providers, the failover will loop back and retry already-failed providers in round-robin order. Default: 3.
  * @property {string} bundlerUrl - The url of the bundler/paymaster service.
- * @property {string} [paymasterUrl] - The url of the paymaster service if different from bundlerUrl (e.g. for Candide which uses separate endpoints).
- * @property {string} delegationAddress - The address of the smart account implementation to delegate to (e.g. '0xe6Cae83BdE06E4c305530e199D7217f42808555B' for SimpleAccount).
+ * @property {string} [paymasterUrl] - The url of the paymaster service when it differs from bundlerUrl. Omit when one url serves both the bundler and paymaster (e.g. Candide, Pimlico).
+ * @property {string} delegationAddress - The address of the smart account implementation to delegate to. It must be an implementation built for the configured `entryPointVersion` (e.g. '0xe6Cae83BdE06E4c305530e199D7217f42808555B' for SimpleAccount on EntryPoint v0.8, '0xa46cc63eBF4Bd77888AA327837d20b23A63a56B5' on v0.9).
+ * @property {'0.8' | '0.9'} [entryPointVersion] - The ERC-4337 EntryPoint version the account operates under. It selects the EntryPoint address and the matching account implementation together. Default: '0.8'.
+ * @property {boolean} [parallel] - When true, each send is placed in a fresh, independent nonce lane (a random 192-bit key at sequence 0) so concurrent or back-to-back sends don't collide on the nonce. Ordering between such sends is not guaranteed and each consumes a new EntryPoint nonce slot. Ignored when `nonceKey` is set. Overridable per call.
+ * @property {number | bigint | string} [nonceKey] - Send in an explicit nonce lane. A string is hashed to a deterministic key — a reusable named lane that resumes the same sequence across sessions; a number or bigint is used as the raw uint192 key and must be within the uint192 range (0 to 2^192 - 1), otherwise the send throws (pass a bigint or string for keys above 2^53). Sends sharing a key are ordered sequentially; different keys run in parallel. Overridable per call.
  */
 
 /**
@@ -89,10 +114,11 @@ import { ConfigurationError } from './errors.js'
 /**
  * @typedef {Object} Evm7702GaslessPaymasterTokenConfig
  * @property {false} [isSponsored] - Whether the paymaster is sponsoring the account.
- * @property {string} [paymasterAddress] - Optional pin on the paymaster smart contract address. When omitted, it's derived from the paymaster RPC (pm_supportedERC20Tokens for Candide, pimlico_getTokenQuotes for Pimlico).
+ * @property {string} paymasterAddress - The paymaster smart contract address to require from the paymaster RPC.
  * @property {Object} paymasterToken - The paymaster token configuration.
  * @property {string} paymasterToken.address - The address of the paymaster token.
- * @property {number | bigint} [transferMaxFee] - The maximum fee amount for transfer operations.
+ * @property {number | bigint} [transferMaxFee] - The maximum fee, in the paymaster token's base units, accepted for transfer. Ignored when the transaction is sponsored.
+ * @property {number | bigint} [transactionMaxFee] - The maximum fee, in the paymaster token's base units, accepted for sendTransaction, signTransaction and approve. Ignored when the transaction is sponsored.
  */
 
 /**
@@ -105,12 +131,32 @@ const GAS_FEE_MULTIPLIER = 150n
 const GAS_FEE_DIVISOR = 100n
 const EXCHANGE_RATE_PRECISION = 10n ** 18n
 
+/**
+ * The supported ERC-4337 EntryPoint versions, keyed by the `entryPointVersion`
+ * configuration value. Each entry pairs an `abstractionkit` account implementation
+ * with the address of the EntryPoint it was built for.
+ */
+const ENTRY_POINT_VERSIONS = new Map([
+  ['0.8', { account: Simple7702Account, address: ENTRYPOINT_V8 }],
+  ['0.9', { account: Simple7702AccountV09, address: ENTRYPOINT_V9 }]
+])
+
+/**
+ * The EntryPoint version used when the configuration does not select one.
+ */
+const DEFAULT_ENTRY_POINT_VERSION = '0.8'
+
+/**
+ * The default network error and ethers error [codes](https://docs.ethers.org/v6/api/utils/errors/) that denote a connectivity failure.
+ */
+const CONNECTIVITY_ERROR_CODES = new Set(['ECONNREFUSED', 'NETWORK_ERROR', 'SERVER_ERROR', 'TIMEOUT'])
+
 export default class WalletAccountReadOnlyEvm7702Gasless extends WalletAccountReadOnly {
   /**
    * Creates a new read-only evm 7702 gasless wallet account.
    *
    * @param {string} address - The evm account's address (the EOA address directly).
-   * @param {Omit<Evm7702GaslessWalletConfig, 'transferMaxFee'>} config - The configuration object.
+   * @param {Omit<Evm7702GaslessWalletConfig, 'transferMaxFee' | 'transactionMaxFee'>} config - The configuration object.
    */
   constructor (address, config) {
     super(address)
@@ -121,9 +167,28 @@ export default class WalletAccountReadOnlyEvm7702Gasless extends WalletAccountRe
      * The read-only evm 7702 gasless wallet account configuration.
      *
      * @protected
-     * @type {Omit<Evm7702GaslessWalletConfig, 'transferMaxFee'>}
+     * @type {Omit<Evm7702GaslessWalletConfig, 'transferMaxFee' | 'transactionMaxFee'>}
      */
     this._config = config
+
+    /**
+     * The shared ethers provider used to interact with the blockchain. A single instance is
+     * built here (or reused from the manager) and passed to every nested `WalletAccountReadOnlyEvm`
+     * so accounts do not open their own connection.
+     *
+     * @protected
+     * @type {Provider}
+     */
+    this._provider = WalletAccountReadOnlyEvm7702Gasless._buildProvider(this._config)
+
+    /**
+     * The EIP-1193 view of {@link _provider} that abstractionkit requires. Built once and backed
+     * by the same underlying connection as {@link _provider}.
+     *
+     * @protected
+     * @type {Eip1193Provider}
+     */
+    this._eip1193Provider = this._buildEip1193Provider(this._config, this._provider)
 
     /**
      * The chain id.
@@ -205,7 +270,7 @@ export default class WalletAccountReadOnlyEvm7702Gasless extends WalletAccountRe
    * @returns {Promise<Omit<TransactionResult, 'hash'>>} The transaction's quotes.
    */
   async quoteSendTransaction (tx, config) {
-    const mergedConfig = { ...this._config, ...config }
+    const mergedConfig = { ...this._config, provider: this._provider, ...config }
 
     if (config) {
       this._validateConfig(mergedConfig)
@@ -238,6 +303,7 @@ export default class WalletAccountReadOnlyEvm7702Gasless extends WalletAccountRe
   /**
    * Returns a transaction's receipt.
    *
+   * @deprecated Use {@link getTransaction} instead, which returns a normalized, finality-based receipt. The raw ethers receipt and the user operation receipt remain available on its `receipt` and `userOperationReceipt` properties.
    * @param {string} hash - The user operation hash.
    * @returns {Promise<EvmTransactionReceipt | null>} The receipt, or null if the transaction has not been included in a block yet.
    */
@@ -251,6 +317,73 @@ export default class WalletAccountReadOnlyEvm7702Gasless extends WalletAccountRe
     }
 
     return await evmReadOnlyAccount.getTransactionReceipt(userOpReceipt.receipt.transactionHash)
+  }
+
+  /**
+   * Returns a normalized, finality-based receipt for a user operation. Finality and confirmations come from the bundling transaction; `success` and `fee` come from the user operation.
+   *
+   * @param {string} hash - The user operation hash.
+   * @returns {Promise<TransactionReceipt & Evm7702GaslessTransactionDetails>} The normalized receipt.
+   * @throws {ValueError} If the hash is not a valid user operation hash.
+   * @throws {NoSuchElementError} If no user operation has been found for the given hash.
+   */
+  async getTransaction (hash) {
+    if (!isHexString(hash, 32)) {
+      throw new ValueError(`Invalid user operation hash: '${hash}'.`)
+    }
+
+    const bundler = this._getBundler()
+
+    const userOpByHash = await bundler.getUserOperationByHash(hash)
+    if (!userOpByHash) {
+      throw new NoSuchElementError(`No user operation found for '${hash}'.`)
+    }
+
+    if (!userOpByHash.transactionHash) {
+      return {
+        hash,
+        finality: 'pending',
+        confirmations: 0,
+        receipt: null,
+        userOperationReceipt: null
+      }
+    }
+
+    const [evmReadOnlyAccount, userOpReceipt] = await Promise.all([
+      this._getEvmReadOnlyAccount(),
+      bundler.getUserOperationReceipt(hash)
+    ])
+
+    const info = await evmReadOnlyAccount.getTransaction(userOpByHash.transactionHash)
+
+    return {
+      ...info,
+      hash,
+      success: userOpReceipt ? userOpReceipt.success : info.success,
+      fee: userOpReceipt ? userOpReceipt.actualGasCost : info.fee,
+      userOperationReceipt: userOpReceipt
+    }
+  }
+
+  /**
+   * Blocks until a user operation reaches a terminal state (the requested finality target or `dropped`), or times out.
+   *
+   * @param {string} hash - The user operation hash.
+   * @param {WaitForTransactionOptions} [options] - The wait options.
+   * @returns {Promise<TransactionReceipt & Evm7702GaslessTransactionDetails>} The terminal receipt: the finality target reached (inspect `success` to tell success from revert), or `dropped`.
+   * @throws {TimeoutError} If the target is not reached before the timeout.
+   */
+  async waitForTransaction (hash, options = {}) {
+    return await super.waitForTransaction(hash, options)
+  }
+
+  /**
+   * Overrides the base default to allow for slower gasless/bundler inclusion and confirmation.
+   *
+   * @type {number}
+   */
+  get defaultWaitTimeout () {
+    return 180000
   }
 
   /**
@@ -302,11 +435,113 @@ export default class WalletAccountReadOnlyEvm7702Gasless extends WalletAccountRe
   }
 
   /**
-   * Validates the configuration to ensure all required fields are present.
+   * Adapts an ethers provider (or failover aggregate) to the EIP-1193 interface required by
+   * abstractionkit, without constructing a new provider. Already-EIP-1193 objects (e.g. a browser
+   * wallet) are returned as-is; ethers providers are wrapped so `request` forwards to `send`,
+   * reusing the same underlying connection.
+   *
+   * @protected
+   * @param {Provider | Eip1193Provider} provider - The ethers provider (or EIP-1193 provider) to adapt.
+   * @returns {Eip1193Provider} An EIP-1193-compatible provider that reuses the given client.
+   */
+  static _asEip1193 (provider) {
+    if (typeof provider.request === 'function') {
+      return provider
+    }
+
+    return {
+      request ({ method, params }) {
+        return provider.send(method, params ?? [])
+      }
+    }
+  }
+
+  /**
+   * Builds the EIP-1193 view that abstractionkit needs. A caller-supplied EIP-1193 provider is
+   * reused directly (so abstractionkit talks to it without an extra `BrowserProvider` round-trip);
+   * otherwise the shared ethers provider is adapted so `request` forwards to `send`. Both share the
+   * same underlying connection as {@link _provider}.
+   *
+   * @protected
+   * @param {Omit<Evm7702GaslessWalletConfig, 'transferMaxFee' | 'transactionMaxFee'>} config - The configuration object.
+   * @param {Provider} provider - The shared ethers provider built from `config`.
+   * @returns {Eip1193Provider} The EIP-1193 provider that reuses the given connection.
+   */
+  _buildEip1193Provider (config, provider) {
+    const { provider: configured } = config
+    const source = configured && typeof configured.request === 'function' ? configured : provider
+
+    return WalletAccountReadOnlyEvm7702Gasless._asEip1193(source)
+  }
+
+  /**
+   * Builds the single shared ethers provider from the configuration: a url string ->
+   * `JsonRpcProvider`, an already-built ethers provider -> reused as-is, an EIP-1193 provider ->
+   * wrapped in a `BrowserProvider`, and a list of the above -> a `FailoverProvider` (built at the
+   * EIP-1193 level so it only fails over on connectivity errors) wrapped once in a `BrowserProvider`.
+   * A manager builds one instance and shares it with every account.
+   *
+   * @protected
+   * @param {Omit<Evm7702GaslessWalletConfig, 'transferMaxFee' | 'transactionMaxFee'>} [config] - The configuration object.
+   * @returns {Provider | undefined} The shared provider, or undefined if none is configured.
+   * @throws {ConfigurationError} If the `provider` option is set to an empty array.
+   */
+  static _buildProvider (config = {}) {
+    const { provider, retries = 3 } = config
+
+    const toOption = (entry) => {
+      if (typeof entry === 'string') {
+        return new JsonRpcProvider(entry)
+      }
+
+      if (typeof entry.request === 'function') {
+        return new BrowserProvider(entry)
+      }
+
+      return entry
+    }
+
+    if (Array.isArray(provider)) {
+      if (!provider.length) {
+        throw new ConfigurationError("The 'provider' option cannot be set to an empty list.")
+      }
+
+      const failoverProvider = new FailoverProvider({
+        retries,
+        shouldRetryOn: (error) => [...CONNECTIVITY_ERROR_CODES].some((code) => isError(error, code))
+      })
+
+      // Add each provider at the EIP-1193 level so connectivity errors reach `shouldRetryOn` with
+      // their original codes intact. Wrapping an entry in a `BrowserProvider` here would re-code its
+      // errors as `UNKNOWN_ERROR` and defeat the connectivity check, so we only wrap the whole
+      // failover once (below) to keep `_provider` an ethers provider. `_asEip1193` returns an
+      // EIP-1193 provider untouched and adapts a url (via `JsonRpcProvider`) or ethers provider
+      // through `send`.
+      for (const entry of provider) {
+        const source = typeof entry === 'string' ? new JsonRpcProvider(entry) : entry
+
+        failoverProvider.addProvider(WalletAccountReadOnlyEvm7702Gasless._asEip1193(source))
+      }
+
+      return new BrowserProvider(failoverProvider.initialize())
+    }
+
+    if (provider) {
+      return toOption(provider)
+    }
+
+    return undefined
+  }
+
+  /**
+   * Validates the configuration to ensure all required fields are present and that
+   * the selected EntryPoint version and delegation implementation are compatible.
    *
    * @protected
    * @param {Partial<Evm7702GaslessWalletConfig>} config - The configuration to validate.
    * @throws {ConfigurationError} If the configuration is invalid or has missing required fields.
+   * @throws {ConfigurationError} If `entryPointVersion` is not a supported EntryPoint version.
+   * @throws {ConfigurationError} If `delegationAddress` is the reference implementation of an EntryPoint version other than the configured one.
    * @returns {void}
    */
   _validateConfig (config) {
@@ -319,21 +554,53 @@ export default class WalletAccountReadOnlyEvm7702Gasless extends WalletAccountRe
     if (!config.delegationAddress) {
       throw new ConfigurationError('Missing required configuration field: delegationAddress.')
     }
+    if (config.entryPointVersion !== undefined && !ENTRY_POINT_VERSIONS.has(config.entryPointVersion)) {
+      const supported = [...ENTRY_POINT_VERSIONS.keys()].map(version => `'${version}'`).join(', ')
+      throw new ConfigurationError(
+        `The 'entryPointVersion' option must be one of ${supported}; received ${config.entryPointVersion}.`
+      )
+    }
+
+    const entryPointVersion = config.entryPointVersion ?? DEFAULT_ENTRY_POINT_VERSION
+    for (const [version, { account }] of ENTRY_POINT_VERSIONS) {
+      if (version === entryPointVersion) continue
+      if (account.DEFAULT_DELEGATEE_ADDRESS.toLowerCase() !== config.delegationAddress.toLowerCase()) continue
+
+      throw new ConfigurationError(
+        `The 'delegationAddress' option (${config.delegationAddress}) is the reference implementation for EntryPoint v${version}, but the 'entryPointVersion' option is '${entryPointVersion}'. An implementation only accepts user operations from the EntryPoint it was built for: set 'entryPointVersion' to '${version}', or point 'delegationAddress' at a v${entryPointVersion} implementation.`
+      )
+    }
     if (!config.isSponsored && !config.paymasterToken) {
       throw new ConfigurationError('Missing required paymaster token configuration fields: paymasterToken.')
+    }
+    if (!config.isSponsored && !config.paymasterAddress) {
+      throw new ConfigurationError('Missing required paymaster token configuration fields: paymasterAddress.')
     }
   }
 
   /**
-   * Returns the chain id.
+   * Returns the chain id, asserting the provider is on the configured network.
+   *
+   * The value is read once from the provider (`eth_chainId`), checked against
+   * `config.chainId`, and cached. Every UserOperation is built and signed against
+   * this value, so a provider reporting a different chain than the one the
+   * application configured must fail here rather than produce a signature for the
+   * wrong network. The check is skipped when `config.chainId` is omitted.
    *
    * @protected
    * @returns {Promise<bigint>} The chain id.
+   * @throws {ConfigurationError} If the provider's chain id does not match `config.chainId`.
    */
   async _getChainId () {
     if (this._chainId === undefined) {
-      const evmReadOnlyAccount = await this._getEvmReadOnlyAccount()
-      const { chainId } = await evmReadOnlyAccount._provider.getNetwork()
+      const chainId = BigInt(await sendJsonRpcRequest(this._eip1193Provider, 'eth_chainId', []))
+
+      if (this._config.chainId !== undefined && chainId !== BigInt(this._config.chainId)) {
+        throw new ConfigurationError(
+          `Provider is on chain ${chainId} but the wallet is configured for chain ${this._config.chainId}`
+        )
+      }
+
       this._chainId = chainId
     }
 
@@ -365,12 +632,17 @@ export default class WalletAccountReadOnlyEvm7702Gasless extends WalletAccountRe
    *
    * @protected
    * @param {EvmTransaction[]} txs - The transactions to batch into the user operation.
-   * @param {Omit<Evm7702GaslessWalletConfig, 'transferMaxFee'>} config - The merged wallet configuration (base config merged with any per-call overrides).
+   * @param {Omit<Evm7702GaslessWalletConfig, 'transferMaxFee' | 'transactionMaxFee'>} config - The merged wallet configuration (base config merged with any per-call overrides).
    * @param {BuildSponsoredUserOperationOverrides} [overrides] - Optional overrides for the build step (currently only the pre-signed 7702 authorization).
    * @returns {Promise<SponsoredUserOperation>} The paymaster-populated user operation plus the token-quote data (when applicable).
+   * @throws {Error} If the token paymaster reports AA50 (account does not hold the paymaster token).
+   * @throws {ConfigurationError} If the configured `paymasterAddress` does not match the address returned by the paymaster RPC.
    */
   async _buildSponsoredUserOperation (txs, config, overrides = {}) {
-    const smartAccount = this._getSmartAccount()
+    // Fail before any bundler/paymaster round-trip if the provider is on the wrong chain.
+    await this._getChainId()
+
+    const smartAccount = await this._getSmartAccount()
 
     const calls = txs.map(tx => ({
       to: tx.to,
@@ -382,6 +654,7 @@ export default class WalletAccountReadOnlyEvm7702Gasless extends WalletAccountRe
 
     const createOverrides = {
       ...(overrides.eip7702Auth ? { eip7702Auth: overrides.eip7702Auth } : {}),
+      ...(overrides.nonce !== undefined ? { nonce: overrides.nonce } : {}),
       maxFeePerGas,
       maxPriorityFeePerGas
     }
@@ -394,7 +667,7 @@ export default class WalletAccountReadOnlyEvm7702Gasless extends WalletAccountRe
     try {
       const op = await smartAccount.createUserOperation(
         calls,
-        WalletAccountReadOnlyEvm7702Gasless._resolveProviderRpc(config.provider),
+        this._eip1193Provider,
         config.bundlerUrl,
         createOverrides
       )
@@ -413,7 +686,7 @@ export default class WalletAccountReadOnlyEvm7702Gasless extends WalletAccountRe
       throw error
     }
 
-    if (!config.isSponsored && config.paymasterAddress && sponsoredOp.paymaster &&
+    if (!config.isSponsored && sponsoredOp.paymaster &&
         sponsoredOp.paymaster.toLowerCase() !== config.paymasterAddress.toLowerCase()) {
       throw new ConfigurationError(
         `paymasterAddress mismatch: configured ${config.paymasterAddress} but RPC ${paymasterUrl} returned ${sponsoredOp.paymaster}.`
@@ -423,11 +696,57 @@ export default class WalletAccountReadOnlyEvm7702Gasless extends WalletAccountRe
     return { userOperation: sponsoredOp, tokenQuote }
   }
 
+  /**
+   * Returns the EntryPoint version the account operates under, as selected by the
+   * `entryPointVersion` configuration field. Every other EntryPoint-dependent
+   * operation of the account resolves through it.
+   *
+   * @protected
+   * @returns {Promise<'0.8' | '0.9'>} The selected EntryPoint version.
+   */
+  async _getEntryPointVersion () {
+    return this._config.entryPointVersion ?? DEFAULT_ENTRY_POINT_VERSION
+  }
+
+  /**
+   * Returns the address of the EntryPoint the account operates under.
+   *
+   * @protected
+   * @returns {Promise<string>} The address of the EntryPoint user operations are submitted to and nonces are read from.
+   */
+  async _getEntryPointAddress () {
+    const { address } = await this._getEntryPoint()
+
+    return address
+  }
+
+  /**
+   * Builds the EIP-712 payload that authorizes a user operation under the
+   * EntryPoint version the account operates under.
+   *
+   * @protected
+   * @param {UserOperationV8} userOp - The user operation to authorize.
+   * @param {bigint} chainId - The id of the chain the user operation is signed for.
+   * @returns {Promise<TypedData>} The typed data to sign.
+   */
+  async _getUserOperationTypedData (userOp, chainId) {
+    const { account: Account, address: entrypointAddress } = await this._getEntryPoint()
+
+    return Account.getUserOperationEip712Data(userOp, chainId, { entrypointAddress })
+  }
+
   /** @private */
-  _getSmartAccount () {
+  async _getEntryPoint () {
+    return ENTRY_POINT_VERSIONS.get(await this._getEntryPointVersion())
+  }
+
+  /** @private */
+  async _getSmartAccount () {
     if (!this._smartAccount) {
-      this._smartAccount = new Simple7702Account(this._address, {
-        entrypointAddress: ENTRYPOINT_V8,
+      const { account: Account, address } = await this._getEntryPoint()
+
+      this._smartAccount = new Account(await this.getAddress(), {
+        entrypointAddress: address,
         delegateeAddress: this._config.delegationAddress
       })
     }
@@ -448,7 +767,7 @@ export default class WalletAccountReadOnlyEvm7702Gasless extends WalletAccountRe
   async _getEvmReadOnlyAccount () {
     if (!this._evmReadOnlyAccount) {
       const address = await this.getAddress()
-      this._evmReadOnlyAccount = new WalletAccountReadOnlyEvm(address, this._config)
+      this._evmReadOnlyAccount = new WalletAccountReadOnlyEvm(address, { ...this._config, provider: this._provider })
     }
     return this._evmReadOnlyAccount
   }
@@ -479,35 +798,20 @@ export default class WalletAccountReadOnlyEvm7702Gasless extends WalletAccountRe
       }
     }
 
-    let maxFeePerGas, maxPriorityFeePerGas
+    let methodUnsupported = false
+    const [gasPrice, tip] = await Promise.all([
+      sendJsonRpcRequest(this._eip1193Provider, 'eth_gasPrice', []),
+      sendJsonRpcRequest(this._eip1193Provider, 'eth_maxPriorityFeePerGas', []).catch(error => {
+        if (error?.cause?.code === -32601 || /method not found|not supported/i.test(error?.message ?? '')) {
+          methodUnsupported = true
+          return '0x0'
+        }
+        throw error
+      })
+    ])
 
-    const providerRpc = WalletAccountReadOnlyEvm7702Gasless._resolveProviderRpc(config.provider)
-    if (providerRpc) {
-      let methodUnsupported = false
-      const [gasPrice, tip] = await Promise.all([
-        sendJsonRpcRequest(providerRpc, 'eth_gasPrice', []),
-        sendJsonRpcRequest(providerRpc, 'eth_maxPriorityFeePerGas', []).catch(error => {
-          if (error?.cause?.code === -32601 || /method not found|not supported/i.test(error?.message ?? '')) {
-            methodUnsupported = true
-            return '0x0'
-          }
-          throw error
-        })
-      ])
-
-      maxFeePerGas = BigInt(gasPrice)
-      maxPriorityFeePerGas = methodUnsupported ? maxFeePerGas : BigInt(tip)
-    } else {
-      const evmReadOnlyAccount = await this._getEvmReadOnlyAccount()
-      const feeData = await evmReadOnlyAccount._provider.getFeeData()
-
-      if (feeData.maxFeePerGas == null || feeData.maxPriorityFeePerGas == null) {
-        throw new ConfigurationError('Provider did not return EIP-1559 fee data.')
-      }
-
-      maxFeePerGas = feeData.maxFeePerGas
-      maxPriorityFeePerGas = feeData.maxPriorityFeePerGas
-    }
+    const maxFeePerGas = BigInt(gasPrice)
+    const maxPriorityFeePerGas = methodUnsupported ? maxFeePerGas : BigInt(tip)
 
     return {
       maxFeePerGas: maxFeePerGas * GAS_FEE_MULTIPLIER / GAS_FEE_DIVISOR,
@@ -516,16 +820,10 @@ export default class WalletAccountReadOnlyEvm7702Gasless extends WalletAccountRe
   }
 
   /** @private */
-  static _resolveProviderRpc (provider) {
-    if (typeof provider === 'string') return provider
-    if (Array.isArray(provider)) return provider.find(p => typeof p === 'string')
-    return provider
-  }
-
-  /** @private */
   async _getTokenExchangeRate (config) {
     const tokenAddress = config.paymasterToken.address
     const paymasterUrl = config.paymasterUrl || config.bundlerUrl
+    const { address: entrypointAddress } = await this._getEntryPoint()
 
     if (paymasterUrl.includes('pimlico')) {
       const chainId = await this._getChainId()
@@ -533,7 +831,7 @@ export default class WalletAccountReadOnlyEvm7702Gasless extends WalletAccountRe
 
       const res = await sendJsonRpcRequest(paymasterUrl, 'pimlico_getTokenQuotes', [
         { tokens: [tokenAddress] },
-        ENTRYPOINT_V8,
+        entrypointAddress,
         chainIdHex
       ])
 
@@ -541,7 +839,7 @@ export default class WalletAccountReadOnlyEvm7702Gasless extends WalletAccountRe
     }
 
     // Candide (and generic ERC-7677 providers that mirror Candide's shape).
-    const res = await sendJsonRpcRequest(paymasterUrl, 'pm_supportedERC20Tokens', [ENTRYPOINT_V8])
+    const res = await sendJsonRpcRequest(paymasterUrl, 'pm_supportedERC20Tokens', [entrypointAddress])
 
     const token = res.tokens.find(
       t => t.address.toLowerCase() === tokenAddress.toLowerCase()
@@ -562,12 +860,12 @@ export default class WalletAccountReadOnlyEvm7702Gasless extends WalletAccountRe
    *
    * @protected
    * @param {EvmTransaction[]} txs - The transactions to batch into the user operation.
-   * @param {Omit<Evm7702GaslessWalletConfig, 'transferMaxFee'>} config - The merged wallet configuration.
+   * @param {Omit<Evm7702GaslessWalletConfig, 'transferMaxFee' | 'transactionMaxFee'>} config - The merged wallet configuration.
+   * @param {BuildSponsoredUserOperationOverrides} [overrides] - Optional build overrides forwarded to `_buildSponsoredUserOperation` (e.g. an explicit EntryPoint nonce).
    * @returns {Promise<UserOperationGasCost>} The fee plus the built user operation and the token-quote data, cacheable between quote and send.
-   * @throws {Error} If the paymaster simulation reports AA50 (account does not hold enough of the paymaster token to cover the gas cost).
    */
-  async _getUserOperationGasCost (txs, config) {
-    const { userOperation: sponsoredOp, tokenQuote } = await this._buildSponsoredUserOperation(txs, config)
+  async _getUserOperationGasCost (txs, config, overrides) {
+    const { userOperation: sponsoredOp, tokenQuote } = await this._buildSponsoredUserOperation(txs, config, overrides)
 
     let fee
     if (tokenQuote?.tokenCost != null) {
